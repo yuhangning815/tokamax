@@ -182,6 +182,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
         acc_consumed_barrier,
     ) = barriers
 
+    plgpu.griddepcontrol_wait()
+
     m, k = x_gmem.shape
     num_k_iters = pl.cdiv(k, block_k)
     cluster_idx = lax.axis_index("x")
@@ -427,6 +429,8 @@ def ragged_dot_gpu_quant_blackwell_kernel(
             lax.fori_loop(0, split_m, store_loop_body, None)
 
       return carry + (actual_size > 0)
+
+    plgpu.griddepcontrol_launch_dependents()
 
   def kernel_entry(*refs):
     x_smem = plgpu.SMEM(
