@@ -22,6 +22,7 @@ import chex
 import jax
 from jax import export
 import jax.numpy as jnp
+import qwix
 from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src.ops.normalization import api
@@ -120,6 +121,84 @@ class LayerNormTest(parameterized.TestCase):
             # Ensure the Triton implementation is used.
             self.assertIsInstance(opspecs[0].op, triton_impl)
             self.assertIsInstance(opspecs[1].op, triton_vjp_impl)
+
+
+class RmsNormTest(parameterized.TestCase):
+
+  @parameterized.product(
+      shape=((128, 512), (2, 128, 1024)),
+      subchannel_size=(512, 256),
+      use_scale=(True, False),
+  )
+  def test_xla_quantized_api(self, shape, subchannel_size, use_scale):
+    if shape[-1] % subchannel_size != 0:
+      self.skipTest("shape[-1] must be divisible by subchannel_size.")
+
+    rng_x, rng_scale = jax.random.split(jax.random.PRNGKey(0))
+    x = jax.random.normal(rng_x, shape, dtype=jnp.bfloat16)
+    scale = (
+        jax.random.uniform(rng_scale, (shape[-1],), dtype=jnp.bfloat16)
+        if use_scale
+        else None
+    )
+    actual = api.rms_norm(
+        x,
+        scale,
+        quantize=True,
+        qtype=jnp.float8_e4m3fn,
+        subchannel_size=subchannel_size,
+        implementation="xla",
+    )
+    expected_y = api.layer_norm(
+        x,
+        scale,
+        offset=None,
+        subtract_mean=False,
+        implementation="xla",
+    )
+    tiled_axes = {axis: 1 for axis in range(expected_y.ndim - 1)}
+    tiled_axes[expected_y.ndim - 1] = subchannel_size
+    expected = qwix.quantize(
+        expected_y,
+        jnp.float8_e4m3fn,
+        tiled_axes=tiled_axes,
+    )
+
+    self.assertEqual(actual.qvalue.shape, x.shape)
+    self.assertEqual(
+        actual.scale.shape,
+        (*shape[:-1], shape[-1] // subchannel_size),
+    )
+    chex.assert_trees_all_close(
+        qwix.dequantize(actual), qwix.dequantize(expected)
+    )
+
+  @parameterized.product(
+      shape=((128, 512), (2, 128, 1024)),
+      use_scale=(True, False),
+  )
+  def test_xla_dense_api(self, shape, use_scale):
+    rng_x, rng_scale = jax.random.split(jax.random.PRNGKey(0))
+    x = jax.random.normal(rng_x, shape, dtype=jnp.bfloat16)
+    scale = (
+        jax.random.uniform(rng_scale, (shape[-1],), dtype=jnp.bfloat16)
+        if use_scale
+        else None
+    )
+    actual = api.rms_norm(
+        x,
+        scale,
+        quantize=False,
+        implementation="xla",
+    )
+    expected = api.layer_norm(
+        x,
+        scale,
+        offset=None,
+        subtract_mean=False,
+        implementation="xla",
+    )
+    chex.assert_trees_all_close(actual, expected)
 
 
 class LayerNormTritonTest(test_base.NormalizationTestBase):

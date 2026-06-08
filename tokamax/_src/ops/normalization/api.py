@@ -15,16 +15,19 @@
 """Layer Normalization API."""
 
 from collections.abc import Callable, Sequence
-from typing import Any, Final, Literal, TypeAlias, cast
+from typing import Any, Final, Literal, TypeAlias
 
 from absl import logging
 import immutabledict
 import jax
+import jax.numpy as jnp
+import qwix
 from tokamax._src import gpu_utils
 from tokamax._src.ops.normalization import base
 
 
 Implementation: TypeAlias = Literal['xla', 'triton']
+RmsNormImplementation: TypeAlias = Literal['xla', 'mosaic_gpu']
 
 _IMPLEMENTATIONS = dict(xla=base.Normalization())
 _DEFAULT_IMPLEMENTATIONS = ('xla',)
@@ -36,6 +39,13 @@ try:
   _DEFAULT_IMPLEMENTATIONS = ('triton',) + _DEFAULT_IMPLEMENTATIONS
 except ImportError:
   pass
+
+try:
+  # pylint: disable=g-import-not-at-top
+  from tokamax._src.ops.normalization import pallas_mosaic_gpu
+  # pylint: enable=g-import-not-at-top
+except ImportError:
+  pallas_mosaic_gpu = None
 
 
 IMPLEMENTATIONS: Final[immutabledict.immutabledict[str, Callable[..., Any]]] = (
@@ -123,6 +133,136 @@ def layer_norm(
           scale_offset=scale_offset,
           subtract_mean=subtract_mean,
       )
+    except NotImplementedError as e:
+      logging.exception('Failed to run implementation')
+      errors.append(e)
+
+  raise ExceptionGroup('all implementations failed', errors)
+
+
+def _rms_norm_xla(
+    x: jax.Array,
+    scale: jax.Array | None,
+    *,
+    epsilon: float,
+    quantize: bool,
+    qtype: jax.typing.DTypeLike,
+    subchannel_size: int,
+) -> jax.Array | qwix.QArray:
+  y = base.Normalization()(
+      x=x,
+      scale=scale,
+      offset=None,
+      epsilon=epsilon,
+      subtract_mean=False,
+  )
+  if not quantize:
+    return y
+  if subchannel_size <= 0:
+    raise ValueError(f'{subchannel_size=} must be positive.')
+  if x.shape[-1] % subchannel_size != 0:
+    raise NotImplementedError(
+        f'Expected last dimension {x.shape[-1]} to be divisible by'
+        f' {subchannel_size=}.'
+    )
+  tiled_axes = {axis: 1 for axis in range(y.ndim - 1)}
+  tiled_axes[y.ndim - 1] = subchannel_size
+  return qwix.quantize(y, qtype, tiled_axes=tiled_axes)
+
+
+def rms_norm(
+    x: jax.Array,
+    scale: jax.Array | None = None,
+    *,
+    epsilon: float = 1e-6,
+    quantize: bool = False,
+    qtype: jax.typing.DTypeLike = jnp.float8_e4m3fn,
+    subchannel_size: int = 512,
+    d_model: int | None = None,
+    implementation: (
+        RmsNormImplementation
+        | Sequence[RmsNormImplementation]
+        | None
+    ) = None,
+) -> jax.Array | qwix.QArray:
+  """RMSNorm with optional tiled activation quantization.
+
+  RMSNorm math is performed in float32 and cast back to ``x.dtype``. If
+  ``quantize=True``, the result is then absmax-quantized. This lets baseline
+  RMSNorm and fused RMSNorm+quantize share the same kernel path.
+
+  Args:
+    x: Input activations with shape ``(*B, C)``.
+    scale: Optional RMSNorm scale with shape ``(C,)``.
+    epsilon: RMSNorm epsilon.
+    quantize: If ``True``, return a Qwix QArray. Otherwise return dense RMSNorm
+      output with the same dtype and shape as ``x``.
+    qtype: Quantized activation dtype used when ``quantize=True``. Defaults to
+      ``float8_e4m3fn``.
+    subchannel_size: Last-axis quantization tile size used when
+      ``quantize=True``. Defaults to 512.
+    d_model: Optional expected last-axis size.
+    implementation: ``'mosaic_gpu'`` for the Mosaic GPU kernel, ``'xla'`` for
+      the JAX reference path, or ``None`` to try Mosaic GPU first and fall back
+      to XLA.
+
+  Returns:
+    Dense RMSNorm output if ``quantize=False``. Otherwise, a Qwix QArray with
+    ``qvalue.shape == x.shape`` and tiled scales of shape
+    ``(*B, C // subchannel_size)``.
+  """
+  if d_model is not None and x.shape[-1] != d_model:
+    raise ValueError(f'Expected last dimension {d_model=}, got {x.shape[-1]}.')
+  if scale is not None and scale.shape != (x.shape[-1],):
+    raise ValueError(f'Expected scale shape {(x.shape[-1],)}, got {scale.shape}.')
+
+  if implementation is None:
+    implementation = ('mosaic_gpu', 'xla')
+  elif isinstance(implementation, str):
+    implementation = (implementation,)
+  elif not implementation:
+    raise ValueError('`implementation` must not be an empty sequence.')
+
+  errors = []
+  for impl in implementation:
+    if impl == 'mosaic_gpu':
+      if pallas_mosaic_gpu is None:
+        errors.append(NotImplementedError('Mosaic GPU implementation unavailable.'))
+        continue
+      if not gpu_utils.has_mosaic_gpu_support():
+        errors.append(
+            NotImplementedError('Mosaic GPU not supported on this platform.')
+        )
+        continue
+      if not gpu_utils.is_sm100():
+        errors.append(
+            NotImplementedError(
+                'Mosaic GPU RMSNorm is currently only enabled for SM100 GPUs.'
+            )
+        )
+        continue
+
+    try:
+      if impl == 'mosaic_gpu':
+        return pallas_mosaic_gpu.rms_norm(
+            x,
+            scale,
+            epsilon=epsilon,
+            quantize=quantize,
+            qtype=qtype,
+            subchannel_size=subchannel_size,
+        )
+      elif impl == 'xla':
+        return _rms_norm_xla(
+            x,
+            scale,
+            epsilon=epsilon,
+            quantize=quantize,
+            qtype=qtype,
+            subchannel_size=subchannel_size,
+        )
+      else:
+        raise ValueError(f'Unknown implementation: {impl}')
     except NotImplementedError as e:
       logging.exception('Failed to run implementation')
       errors.append(e)
