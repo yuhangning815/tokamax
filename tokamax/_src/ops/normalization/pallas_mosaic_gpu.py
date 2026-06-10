@@ -50,15 +50,6 @@ packed_width = packed_quant.packed_width
 unpack_rms_norm_quant = packed_quant.unpack_rms_norm_quant
 
 
-# Primary path packs value+scale into one ``uint8`` buffer inside the kernel.
-# If the in-kernel width-changing bf16->uint8 bitcast fails to lower on a given
-# Mosaic GPU build, flip this to ``False``: the kernel then emits the two
-# native-dtype outputs and ``packed_quant.pack_qvalue_scale`` packs them
-# post-kernel. The public API and the packed byte layout are identical either
-# way.
-_PACK_IN_KERNEL = True
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Configuration for the RMSNorm Mosaic GPU kernel."""
@@ -68,49 +59,6 @@ class Config:
   def __post_init__(self):
     if self.block_m <= 0:
       raise ValueError(f"{self.block_m=} must be positive.")
-
-
-def _quantize(
-    x: jax.Array,
-    qtype: jnp.dtype,
-    *,
-    subchannel_size: int,
-) -> tuple[jax.Array, jax.Array]:
-  """Quantizes one normalized 1-D row (``(C,)``) with per-subchannel scales.
-
-  Mosaic GPU cannot lower a reduction over axis 1 of a vector reshaped to
-  ``(num_tiles, subchannel_size)`` -- such a tile has no register layout, so the
-  lowering raises "No support for axes yet". We therefore unroll over the
-  (statically known) subchannel tiles and reduce each 1-D slice to a scalar,
-  the same reduction shape the RMSNorm mean already uses successfully. For the
-  common single-tile case (``subchannel_size == C``) this is a single scalar
-  reduce with no concatenation.
-  """
-  num_tiles = x.shape[0] // subchannel_size
-  if qtype == jnp.dtype(jnp.int8):
-    qmax = jnp.array(127.5, dtype=x.dtype)
-  else:
-    qmax = jnp.array(jnp.finfo(qtype).max, dtype=x.dtype)
-
-  q_tiles = []
-  scales = []
-  for t in range(num_tiles):
-    tile = x[t * subchannel_size : (t + 1) * subchannel_size]  # (subchannel,)
-    absmax = jnp.max(jnp.abs(tile))  # scalar; 1-D reduce, Mosaic-friendly
-    scale = absmax / qmax
-    scale = jnp.where(absmax == 0.0, jnp.array(1.0, dtype=x.dtype), scale)
-    q = tile * (1.0 / scale)
-    if qtype == jnp.dtype(jnp.int8):
-      q = jnp.round(jnp.clip(q, -127.5, 126.75)).astype(qtype)
-    else:
-      qinfo = jnp.finfo(qtype)
-      q = jnp.clip(q, qinfo.min, qinfo.max).astype(qtype)
-    q_tiles.append(q)
-    scales.append(scale.reshape((1,)))
-
-  if num_tiles == 1:
-    return q_tiles[0], scales[0]
-  return jnp.concatenate(q_tiles, axis=0), jnp.concatenate(scales, axis=0)
 
 
 def _rms_norm_row(
@@ -209,7 +157,7 @@ def rms_norm(
         grid=grid,
         grid_names=("row_blocks",),
         kernel_name="rms_norm_sm100",
-        compiler_params=plgpu.CompilerParams(approx_math=True),
+        compiler_params=plgpu.CompilerParams(approx_math=False),
     )
     def kernel(x_gmem, out_gmem):
       row_start = lax.axis_index("row_blocks") * block_m
@@ -231,7 +179,7 @@ def rms_norm(
         grid=grid,
         grid_names=("row_blocks",),
         kernel_name="rms_norm_sm100",
-        compiler_params=plgpu.CompilerParams(approx_math=True),
+        compiler_params=plgpu.CompilerParams(approx_math=False),
     )
     def kernel(x_gmem, scale_gmem, out_gmem):
       row_start = lax.axis_index("row_blocks") * block_m
@@ -304,52 +252,51 @@ def rms_norm_fuse_quant_packed(
         f"Expected last dimension {c} to be divisible by {subchannel_size=}."
     )
   num_scale_tiles = c // subchannel_size
-  value_bytes = c * qtype.itemsize
   width = packed_quant.packed_width(c, qtype, subchannel_size, quant_scale_dtype)
+  qmax = 127.5 if qtype == jnp.dtype(jnp.int8) else float(jnp.finfo(qtype).max)
 
   x_2d = x.reshape((-1, c))
   m = x_2d.shape[0]
   block_m = config.block_m
   grid = ((m + block_m - 1) // block_m,)
 
-  def quantize_row(x_row, scale_row):
-    x_row = _rms_norm_row(
-        x_row,
-        scale_row,
-        epsilon=epsilon,
-        out_dtype=out_dtype,
-    )
-    qvalue, quant_scale = _quantize(
-        x_row,
-        qtype,
-        subchannel_size=subchannel_size,
-    )
-    return qvalue, quant_scale.astype(quant_scale_dtype)
+  out_shape = (
+      jax.ShapeDtypeStruct((m, c), qtype),
+      jax.ShapeDtypeStruct((m, num_scale_tiles), quant_scale_dtype),
+  )
 
-  def write_row(out_gmem, row, qvalue, quant_scale):
-    """Stores one quantized row: packed in-kernel, or as two raw outputs."""
-    if _PACK_IN_KERNEL:
-      # Pack ``[ qvalue bytes | scale bytes ]`` into one contiguous uint8 row.
-      (packed_gmem,) = out_gmem
-      packed_gmem[row, :value_bytes] = lax.bitcast_convert_type(
-          qvalue, jnp.uint8
-      ).reshape((value_bytes,))
-      scale_bytes = lax.bitcast_convert_type(quant_scale, jnp.uint8)
-      packed_gmem[row, value_bytes:] = scale_bytes.reshape(
-          (width - value_bytes,)
-      )
-    else:
-      qvalue_gmem, scale_gmem = out_gmem
-      qvalue_gmem[row, :] = qvalue
-      scale_gmem[row, :] = quant_scale
+  def quant_write_row(x_gmem, weight_gmem, qvalue_gmem, scale_gmem, row):
+    """Fused RMSNorm + per-subchannel quant for one row, tile-by-tile.
 
-  if _PACK_IN_KERNEL:
-    out_shape = jax.ShapeDtypeStruct((m, width), jnp.uint8)
-  else:
-    out_shape = (
-        jax.ShapeDtypeStruct((m, c), qtype),
-        jax.ShapeDtypeStruct((m, num_scale_tiles), quant_scale_dtype),
-    )
+    Mosaic GPU cannot slice a register vector or reduce over an inner axis of a
+    reshaped one, so each subchannel is re-loaded fresh from GMEM (slice loads
+    and full-vector reductions both lower). RMS is a single scalar from the
+    full-row read.
+    """
+    xr = x_gmem[row, :].astype(jnp.float32)
+    rms = lax.rsqrt(jnp.mean(jnp.square(xr), axis=0) + epsilon)
+    for t in range(num_scale_tiles):
+      lo = t * subchannel_size
+      xt = x_gmem[row, lo : lo + subchannel_size].astype(jnp.float32) * rms
+      if weight_gmem is not None:
+        xt = xt * weight_gmem[lo : lo + subchannel_size].astype(jnp.float32)
+      # Round-trip through the input dtype to match the unfused reference.
+      xt = xt.astype(out_dtype).astype(jnp.float32)
+      absmax = jnp.max(jnp.abs(xt))
+      s = absmax / qmax
+      s = jnp.where(absmax == 0.0, jnp.float32(1.0), s)
+      # Round the scale to the stored dtype and quantize by dividing by exactly
+      # that value, so the kernel divides by the same scale dequant multiplies
+      # back (otherwise fp8 codes flip at rounding boundaries vs. qwix).
+      s = s.astype(quant_scale_dtype)
+      q = xt / s.astype(jnp.float32)
+      if qtype == jnp.dtype(jnp.int8):
+        q = jnp.round(jnp.clip(q, -127.5, 126.75)).astype(qtype)
+      else:
+        qinfo = jnp.finfo(qtype)
+        q = jnp.clip(q, float(qinfo.min), float(qinfo.max)).astype(qtype)
+      qvalue_gmem[row, lo : lo + subchannel_size] = q
+      scale_gmem[row, t] = s
 
   if scale is None:
 
@@ -359,19 +306,18 @@ def rms_norm_fuse_quant_packed(
         grid=grid,
         grid_names=("row_blocks",),
         kernel_name="rms_norm_fuse_quant_packed_sm100",
-        compiler_params=plgpu.CompilerParams(approx_math=True),
+        compiler_params=plgpu.CompilerParams(approx_math=False),
     )
-    def kernel(x_gmem, *out_gmem):
+    def kernel(x_gmem, qvalue_gmem, scale_gmem):
       row_start = lax.axis_index("row_blocks") * block_m
       for i in range(block_m):
         row = row_start + i
 
         @pl.when(row < m)
         def _():
-          qvalue, quant_scale = quantize_row(x_gmem[row, :], None)
-          write_row(out_gmem, row, qvalue, quant_scale)
+          quant_write_row(x_gmem, None, qvalue_gmem, scale_gmem, row)
 
-    out = kernel(x_2d)
+    qvalue, quant_scale = kernel(x_2d)
   else:
 
     @functools.partial(
@@ -380,23 +326,18 @@ def rms_norm_fuse_quant_packed(
         grid=grid,
         grid_names=("row_blocks",),
         kernel_name="rms_norm_fuse_quant_packed_sm100",
-        compiler_params=plgpu.CompilerParams(approx_math=True),
+        compiler_params=plgpu.CompilerParams(approx_math=False),
     )
-    def kernel(x_gmem, scale_gmem, *out_gmem):
+    def kernel(x_gmem, weight_gmem, qvalue_gmem, scale_gmem):
       row_start = lax.axis_index("row_blocks") * block_m
-      scale_values = scale_gmem[:]
       for i in range(block_m):
         row = row_start + i
 
         @pl.when(row < m)
         def _():
-          qvalue, quant_scale = quantize_row(x_gmem[row, :], scale_values)
-          write_row(out_gmem, row, qvalue, quant_scale)
+          quant_write_row(x_gmem, weight_gmem, qvalue_gmem, scale_gmem, row)
 
-    out = kernel(x_2d, scale)
+    qvalue, quant_scale = kernel(x_2d, scale)
 
-  if not _PACK_IN_KERNEL:
-    qvalue, quant_scale = out
-    out = packed_quant.pack_qvalue_scale(qvalue, quant_scale)
-
+  out = packed_quant.pack_qvalue_scale(qvalue, quant_scale)
   return out.reshape((*orig_shape[:-1], width))
