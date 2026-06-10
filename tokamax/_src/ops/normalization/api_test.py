@@ -27,6 +27,7 @@ from tokamax._src import gpu_utils
 from tokamax._src import hlo_utils
 from tokamax._src.ops.normalization import api
 from tokamax._src.ops.normalization import base
+from tokamax._src.ops.normalization import packed_quant
 from tokamax._src.ops.normalization import pallas_triton_vjp as pl_norm_vjp
 from tokamax._src.ops.normalization import test_base
 
@@ -130,7 +131,7 @@ class RmsNormTest(parameterized.TestCase):
       subchannel_size=(512, 256),
       use_scale=(True, False),
   )
-  def test_xla_quantized_api(self, shape, subchannel_size, use_scale):
+  def test_xla_fuse_quant_packed_api(self, shape, subchannel_size, use_scale):
     if shape[-1] % subchannel_size != 0:
       self.skipTest("shape[-1] must be divisible by subchannel_size.")
 
@@ -141,14 +142,30 @@ class RmsNormTest(parameterized.TestCase):
         if use_scale
         else None
     )
-    actual = api.rms_norm(
+    qtype = jnp.float8_e4m3fn
+
+    packed = api.rms_norm_fuse_quant_packed(
         x,
         scale,
-        quantize=True,
-        qtype=jnp.float8_e4m3fn,
+        qtype=qtype,
         subchannel_size=subchannel_size,
         implementation="xla",
     )
+    width = packed_quant.packed_width(
+        shape[-1], qtype, subchannel_size, jnp.bfloat16
+    )
+    self.assertEqual(packed.dtype, jnp.dtype(jnp.uint8))
+    self.assertEqual(packed.shape, (*shape[:-1], width))
+
+    restored = api.unpack_rms_norm_quant(
+        packed, c=shape[-1], qtype=qtype, subchannel_size=subchannel_size
+    )
+    self.assertEqual(restored.qvalue.shape, x.shape)
+    self.assertEqual(
+        restored.scale.shape,
+        (*shape[:-1], shape[-1] // subchannel_size),
+    )
+
     expected_y = api.layer_norm(
         x,
         scale,
@@ -158,19 +175,9 @@ class RmsNormTest(parameterized.TestCase):
     )
     tiled_axes = {axis: 1 for axis in range(expected_y.ndim - 1)}
     tiled_axes[expected_y.ndim - 1] = subchannel_size
-    expected = qwix.quantize(
-        expected_y,
-        jnp.float8_e4m3fn,
-        tiled_axes=tiled_axes,
-    )
-
-    self.assertEqual(actual.qvalue.shape, x.shape)
-    self.assertEqual(
-        actual.scale.shape,
-        (*shape[:-1], shape[-1] // subchannel_size),
-    )
+    expected = qwix.quantize(expected_y, qtype, tiled_axes=tiled_axes)
     chex.assert_trees_all_close(
-        qwix.dequantize(actual), qwix.dequantize(expected)
+        qwix.dequantize(restored), qwix.dequantize(expected)
     )
 
   @parameterized.product(
@@ -188,7 +195,6 @@ class RmsNormTest(parameterized.TestCase):
     actual = api.rms_norm(
         x,
         scale,
-        quantize=False,
         implementation="xla",
     )
     expected = api.layer_norm(

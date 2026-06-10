@@ -25,6 +25,11 @@ from tokamax._src.ops.normalization import pallas_mosaic_gpu
 
 
 class PallasMosaicGpuRmsNormTest(parameterized.TestCase):
+  """Tests the production SM100 Mosaic GPU kernels against the XLA golden.
+
+  SM100-only (skipped elsewhere). The portable byte-level wire-format checks
+  live in ``packed_quant_test`` and run without a GPU.
+  """
 
   def setUp(self):
     if not gpu_utils.is_sm100():
@@ -36,9 +41,7 @@ class PallasMosaicGpuRmsNormTest(parameterized.TestCase):
       subchannel_size=(512, 256),
       use_scale=(True, False),
   )
-  def test_quantized_matches_xla_quantize(
-      self, shape, subchannel_size, use_scale
-  ):
+  def test_fuse_quant_packed_roundtrip(self, shape, subchannel_size, use_scale):
     if shape[-1] % subchannel_size != 0:
       self.skipTest("shape[-1] must be divisible by subchannel_size.")
 
@@ -49,30 +52,41 @@ class PallasMosaicGpuRmsNormTest(parameterized.TestCase):
         if use_scale
         else None
     )
+    qtype = jnp.float8_e4m3fn
 
-    actual = pallas_mosaic_gpu.rms_norm(
+    packed = pallas_mosaic_gpu.rms_norm_fuse_quant_packed(
         x,
         scale,
-        quantize=True,
-        qtype=jnp.float8_e4m3fn,
+        qtype=qtype,
         subchannel_size=subchannel_size,
     )
-    expected = api.rms_norm(
+    width = pallas_mosaic_gpu.packed_width(
+        shape[-1], qtype, subchannel_size, jnp.bfloat16
+    )
+    self.assertEqual(packed.dtype, jnp.dtype(jnp.uint8))
+    self.assertEqual(packed.shape, (*shape[:-1], width))
+
+    restored = pallas_mosaic_gpu.unpack_rms_norm_quant(
+        packed, c=shape[-1], qtype=qtype, subchannel_size=subchannel_size
+    )
+    self.assertEqual(restored.qvalue.shape, x.shape)
+    self.assertEqual(
+        restored.scale.shape, (*shape[:-1], shape[-1] // subchannel_size)
+    )
+    self.assertEqual(restored.qtype, jnp.dtype(qtype))
+
+    expected_packed = api.rms_norm_fuse_quant_packed(
         x,
         scale,
-        quantize=True,
-        qtype=jnp.float8_e4m3fn,
+        qtype=qtype,
         subchannel_size=subchannel_size,
         implementation="xla",
     )
-
-    self.assertEqual(actual.qvalue.shape, x.shape)
-    self.assertEqual(
-        actual.scale.shape, (*shape[:-1], shape[-1] // subchannel_size)
+    expected = pallas_mosaic_gpu.unpack_rms_norm_quant(
+        expected_packed, c=shape[-1], qtype=qtype, subchannel_size=subchannel_size
     )
-    self.assertEqual(actual.qtype, jnp.dtype(jnp.float8_e4m3fn))
     chex.assert_trees_all_close(
-        qwix.dequantize(actual),
+        qwix.dequantize(restored),
         qwix.dequantize(expected),
         atol=5e-3,
         rtol=5e-3,
@@ -91,13 +105,8 @@ class PallasMosaicGpuRmsNormTest(parameterized.TestCase):
         else None
     )
 
-    actual = pallas_mosaic_gpu.rms_norm(x, scale, quantize=False)
-    expected = api.rms_norm(
-        x,
-        scale,
-        quantize=False,
-        implementation="xla",
-    )
+    actual = pallas_mosaic_gpu.rms_norm(x, scale)
+    expected = api.rms_norm(x, scale, implementation="xla")
 
     chex.assert_trees_all_close(actual, expected, atol=2e-3, rtol=2e-3)
 
