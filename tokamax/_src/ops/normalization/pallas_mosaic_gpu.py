@@ -76,23 +76,41 @@ def _quantize(
     *,
     subchannel_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-  """Quantizes one normalized row using Qwix-compatible absmax scales."""
-  x_tiled = x.reshape((x.shape[0] // subchannel_size, subchannel_size))
-  absmax = jnp.abs(x_tiled).max(axis=1)
+  """Quantizes one normalized 1-D row (``(C,)``) with per-subchannel scales.
+
+  Mosaic GPU cannot lower a reduction over axis 1 of a vector reshaped to
+  ``(num_tiles, subchannel_size)`` -- such a tile has no register layout, so the
+  lowering raises "No support for axes yet". We therefore unroll over the
+  (statically known) subchannel tiles and reduce each 1-D slice to a scalar,
+  the same reduction shape the RMSNorm mean already uses successfully. For the
+  common single-tile case (``subchannel_size == C``) this is a single scalar
+  reduce with no concatenation.
+  """
+  num_tiles = x.shape[0] // subchannel_size
   if qtype == jnp.dtype(jnp.int8):
     qmax = jnp.array(127.5, dtype=x.dtype)
   else:
     qmax = jnp.array(jnp.finfo(qtype).max, dtype=x.dtype)
-  scale = absmax / qmax
-  scale = jnp.where(absmax == 0.0, jnp.array(1.0, dtype=x.dtype), scale)
-  inv_scale = lax.broadcast_in_dim(1.0 / scale, x_tiled.shape, [0])
-  qvalue = x_tiled * inv_scale
-  if qtype == jnp.dtype(jnp.int8):
-    qvalue = jnp.round(jnp.clip(qvalue, -127.5, 126.75)).astype(qtype)
-  else:
-    qinfo = jnp.finfo(qtype)
-    qvalue = jnp.clip(qvalue, qinfo.min, qinfo.max).astype(qtype)
-  return qvalue.reshape(x.shape), scale
+
+  q_tiles = []
+  scales = []
+  for t in range(num_tiles):
+    tile = x[t * subchannel_size : (t + 1) * subchannel_size]  # (subchannel,)
+    absmax = jnp.max(jnp.abs(tile))  # scalar; 1-D reduce, Mosaic-friendly
+    scale = absmax / qmax
+    scale = jnp.where(absmax == 0.0, jnp.array(1.0, dtype=x.dtype), scale)
+    q = tile * (1.0 / scale)
+    if qtype == jnp.dtype(jnp.int8):
+      q = jnp.round(jnp.clip(q, -127.5, 126.75)).astype(qtype)
+    else:
+      qinfo = jnp.finfo(qtype)
+      q = jnp.clip(q, qinfo.min, qinfo.max).astype(qtype)
+    q_tiles.append(q)
+    scales.append(scale.reshape((1,)))
+
+  if num_tiles == 1:
+    return q_tiles[0], scales[0]
+  return jnp.concatenate(q_tiles, axis=0), jnp.concatenate(scales, axis=0)
 
 
 def _rms_norm_row(
