@@ -24,6 +24,8 @@ from tokamax._src import gpu_utils
 from tokamax._src import quantization
 from tokamax._src.ops.ragged_dot import base
 from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu
+from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_common as common
+from tokamax._src.ops.ragged_dot import pallas_mosaic_gpu_kernel_sm100_fp8_quant_bf16_fp8 as sm100_fp8_quant_bf16_fp8
 from tokamax._src.ops.ragged_dot import test_base
 from typing_extensions import override
 
@@ -159,7 +161,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         n,
         jnp.bfloat16,
         random_groups=True,
-        use_as_qarray=True,
+        use_as_qarray=False,
         quant_a_dtype=jnp.float8_e4m3fn,
         a_tile_shape=(1, 128),
         quant_b_dtype=jnp.int4,
@@ -182,7 +184,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         n,
         jnp.bfloat16,
         random_groups=False,
-        use_as_qarray=True,
+        use_as_qarray=False,
         quant_a_dtype=jnp.float8_e4m3fn,
         a_tile_shape=(1, 128),
         quant_b_dtype=jnp.int4,
@@ -203,7 +205,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         n,
         jnp.bfloat16,
         random_groups=True,
-        use_as_qarray=True,
+        use_as_qarray=False,
         quant_a_dtype=jnp.float8_e4m3fn,
         a_tile_shape=(1, 256),
         quant_b_dtype=jnp.int4,
@@ -220,6 +222,73 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         chex.assert_trees_all_close(
             actual[:count], expected[:count], atol=0.01, rtol=0.005
         )
+
+  def _dequant(self, qarray, subchannel):
+    q = qarray.qvalue.astype(jnp.float32)
+    s = jnp.repeat(qarray.scale.astype(jnp.float32), subchannel, axis=1)
+    return q * s
+
+  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
+  def test_epilogue_quant(self, block_k, activation):
+    # New arch: ONE accumulator of block_n N-cols per CTA -> the fused output
+    # subchannel must equal block_n (= 128). Activation subchannel matched.
+    num_groups, m, k, n = 8, 512, 256, 512
+    sub = 128
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=16,
+        block_n=128,
+        block_k=block_k,
+        epilogue_quant_qtype=common.EpilogueQuantDType.FLOAT8_E4M3FN,
+        epilogue_quant_subchannel_size=sub,
+    )
+    out = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
+        a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
+    )
+    self.assertIsInstance(out, qwix.QArray)
+    self.assertEqual(out.qvalue.dtype, jnp.float8_e4m3fn)
+    actual = self._dequant(out, sub)
+    expected = test_base.ref(a, b, group_sizes, activation)
+    count = int(sum(group_sizes))
+    # fp8_e4m3fn-quantized output -> a few % error.
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.06, rtol=0.1
+    )
+
+  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
+  def test_relaxed_activation_subchannel(self, block_k, activation):
+    # Activation subchannel (128) finer than weight subchannel (512); dense out.
+    # NOTE: uses a 4x ratio (weight 512 / act 128). A 2x ratio (tile_k ==
+    # 2*tile_xk) collides with the production kernel's x_sum-encoded-scale
+    # detection (`scales.shape[1] == 2 * (k_x // tile_k)`) and is unsupported.
+    num_groups, m, k, n = 8, 512, 512, 512
+    a, b, group_sizes = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, 128),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, 512, 1),
+    )
+    config = dataclasses.replace(
+        _CONFIG, block_m=16, block_n=128, block_k=block_k
+    )
+    out = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
+        a, b, jnp.asarray(group_sizes), jnp.bfloat16, config, activation
+    )
+    expected = test_base.ref(a, b, group_sizes, activation)
+    count = int(sum(group_sizes))
+    chex.assert_trees_all_close(
+        out[:count], expected[:count], atol=0.01, rtol=0.005
+    )
 
   def setUp(self):
     if jax.default_backend() == "tpu":
