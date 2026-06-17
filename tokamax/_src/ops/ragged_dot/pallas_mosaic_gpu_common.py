@@ -42,6 +42,13 @@ class MatmulDimension(enum.IntEnum):
   N = 1
 
 
+class EpilogueQuantDType(enum.Enum):
+  """Output quantization dtype for fused ragged-dot epilogues."""
+
+  INT8 = "int8"
+  FLOAT8_E4M3FN = "float8_e4m3fn"
+
+
 @pydantic.dataclasses.dataclass(frozen=True, slots=True)
 class Config:
   """Configuration for the ragged dot kernel."""
@@ -60,6 +67,11 @@ class Config:
   grid_minor_dim: MatmulDimension = MatmulDimension.N
   # The width of tiles along the fastest changing dim.
   grid_tile_width: int = 1
+  # If set, the fp8xint4 SM100 kernel (fp8_quant_bf16_fp8) quantizes its bf16
+  # epilogue output to fp8/int8 in-register and returns a QArray instead of a
+  # dense array. The scale tiling is (1, epilogue_quant_subchannel_size).
+  epilogue_quant_qtype: EpilogueQuantDType | None = None
+  epilogue_quant_subchannel_size: pydantic.PositiveInt | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

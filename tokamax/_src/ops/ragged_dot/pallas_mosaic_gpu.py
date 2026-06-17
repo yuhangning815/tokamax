@@ -28,6 +28,7 @@ from tokamax._src.ops.ragged_dot import base
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_common as common
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100 as sm100
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant as sm100_fp8_quant
+import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_fp8_quant_bf16_fp8 as sm100_fp8_quant_bf16_fp8
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_i8_quant as sm100_i8_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant as sm100_quant
 import tokamax._src.ops.ragged_dot.pallas_mosaic_gpu_kernel_sm100_quant_post_scale as sm100_quant_post_scale
@@ -160,7 +161,17 @@ class PallasMosaicGpuRaggedDot(base.RaggedDot[Config, None]):
           if lhs.qtype == jnp.int8:
             fn = sm100_i8_quant.ragged_dot_gpu_i8_quant_blackwell_kernel
           elif lhs.qtype == jnp.float8_e4m3fn:
-            fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
+            # Route to the fused-output-quant / relaxed-subchannel kernel when
+            # output quantization is requested, or when the activation subchannel
+            # is finer than the weight subchannel. The production kernel is
+            # untouched and still serves the matched-subchannel dense-output case.
+            if (
+                config.epilogue_quant_qtype is not None
+                or lhs.scale_tile_shape[1] != rhs.scale_tile_shape[1]
+            ):
+              fn = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel  # pylint: disable=line-too-long
+            else:
+              fn = sm100_fp8_quant.ragged_dot_gpu_fp8_quant_blackwell_kernel
             # make sure output is bfloat16 since we may want to store lhs.scale
             # as float32 to avoid in-kernel conversion.
             if preferred_element_type is None:
