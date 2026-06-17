@@ -55,7 +55,7 @@ def main():
       32, 34, 35, 34, 28, 33, 26, 29, 42, 31, 35, 32, 32, 33, 33, 38, 42, 35,
       34, 33], jnp.int32)
 
-  def cfg(bk, block_m=16, epilogue=False):
+  def cfg(bk, block_m=64, epilogue=False):  # block_m=64 optimal (sweep: ~12% over 16)
     c = common.Config(
         block_m=block_m, block_n=128, block_k=bk, num_stages=2, split_k=1,
         split_m=1, persistent=True, post_scale=False, collective=False,

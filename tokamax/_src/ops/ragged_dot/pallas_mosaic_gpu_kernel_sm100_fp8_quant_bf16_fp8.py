@@ -770,12 +770,10 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
               qinfo = jnp.finfo(epilogue_quant_dtype)
               is_int8 = epilogue_quant_dtype == jnp.int8
               qmax = 127.5 if is_int8 else float(qinfo.max)
-              # Round through the quantizer's input dtype first (match the
-              # standalone quantizer, which sees bf16-materialized values).
-              acc_q = acc_carry.astype(epilogue_quant_input_dtype).astype(
-                  acc_carry.dtype
-              )
-              absmax = jnp.abs(acc_q).max(axis=0)  # [cluster_block_m]
+              # Quantize the f32 accumulator directly. The fused path never
+              # materializes bf16, so this is strictly more accurate than -- and
+              # skips the two casts of -- a standalone bf16 quantizer.
+              absmax = jnp.abs(acc_carry).max(axis=0)  # [cluster_block_m]
               out_scale = jnp.where(
                   absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
               )
@@ -787,7 +785,7 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
                   lax.broadcast_in_dim(1.0 / out_scale, acc_carry.shape, [1]),
                   _TCGEN05,
               )
-              q = acc_q * inv
+              q = acc_carry * inv
               if is_int8:
                 q = jnp.round(jnp.clip(q, -127.5, 126.75))
               else:
