@@ -291,15 +291,27 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     )
 
   @parameterized.product(
-      block_k=(128,), activation=(None, test_base.relu), block_m=(16, 64)
+      block_k=(128,),
+      activation=(None, test_base.relu),
+      block_m=(16, 64),
+      group_sizes_pat=(
+          # cumsum starts not multiples of align_tile(8) -> a tile straddles two
+          # groups (start_within_block != 0); the fused scale store must write
+          # ONLY this group's valid rows, not the whole aligned bucket.
+          (33, 67, 50, 80, 70, 60, 90, 62),  # mixed ragged
+          # size-1 groups (actual_size==1 single-row scatter) next to big groups
+          # that span many tiles (first ragged, middle aligned, last partial).
+          (1, 7, 199, 1, 100, 50, 151, 3),
+          # zero-size groups (actual_size==0 -> no write) interleaved.
+          (0, 130, 0, 200, 0, 98, 84, 0),
+      ),
   )
-  def test_epilogue_quant_ragged(self, block_k, activation, block_m):
-    # Ragged corner case: group starts (cumsum) 33,100,150,230,300,360,450 are
-    # NOT multiples of align_tile(8), so block_start is rounded DOWN and a tile
-    # straddles two groups (start_within_block != 0, actual_size < block_m). The
-    # fused scale store must write ONLY this group's valid rows; the old store
-    # wrote the whole aligned bucket and corrupted neighbours' scale rows. This
-    # also exercises the fp8 value store under a non-block-aligned block_start.
+  def test_epilogue_quant_ragged(
+      self, block_k, activation, block_m, group_sizes_pat
+  ):
+    # Corner cases for the ragged fused scale store: a tile straddling two
+    # groups must scatter only [start_within_block, +actual_size); the old store
+    # wrote the whole bucket and corrupted neighbours' scale rows.
     num_groups, m, k, n = 8, 512, 256, 512
     sub = 128
     a, b, _ = self._create_inputs(
@@ -310,8 +322,8 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         quant_b_dtype=jnp.int4,
         b_tile_shape=(1, sub, 1),
     )
-    group_sizes = jnp.array([33, 67, 50, 80, 70, 60, 90, 62], jnp.int32)
-    assert int(group_sizes.sum()) == m
+    group_sizes = jnp.array(group_sizes_pat, jnp.int32)
+    assert int(group_sizes.sum()) == m, group_sizes_pat
     config = dataclasses.replace(
         _CONFIG,
         block_m=block_m,
