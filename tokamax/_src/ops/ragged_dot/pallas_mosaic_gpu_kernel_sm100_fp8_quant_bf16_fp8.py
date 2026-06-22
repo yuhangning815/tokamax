@@ -180,8 +180,8 @@ def write_scales_to_gmem(
   `_TCGEN05_COL` register fragment, which holds several m-rows per thread.
 
   Writes only rows [offset, offset+copy_size) of the tile:
-  `out_scales[scale_col, block_start_m + row] = out_scales_smem[row]`. The scale
-  GMEM is subchannel-major `(n_sub, m)`, so `m` is the last (index-1) dim.
+  `out_scales[block_start_m + row, scale_col] = out_scales_smem[row]`. The scale
+  GMEM is `(m, n_sub)` (m-major); the per-lane scatter is uncoalesced either way.
 
   `cluster_block_m` may exceed the 128 lanes, so each lane statically loops over
   rows {lane, lane+128, ...}; the window predicate keeps every read/write in range
@@ -191,7 +191,7 @@ def write_scales_to_gmem(
 
   @plgpu.inline_mgpu(
       arg_types=(
-          plgpu.RefType(),  # gmem_ref: out_scales (n_sub, m)
+          plgpu.RefType(),  # gmem_ref: out_scales (m, n_sub)
           plgpu.RefType(),  # smem_ref: out_scales_smem [cluster_block_m]
           plgpu.Layout.WG_SPLAT,  # copy_size = actual_size
           plgpu.Layout.WG_SPLAT,  # offset = start_within_block
@@ -227,7 +227,7 @@ def write_scales_to_gmem(
       with mgpu.utils.when(cond):
         gmem_m = arith.addi(bs_i, row)
         val = memref_dialect.load(smem_ref, [row])
-        memref_dialect.store(val, gmem_ref, [col_i, gmem_m])
+        memref_dialect.store(val, gmem_ref, [gmem_m, col_i])
 
   return _store(
       gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
@@ -848,12 +848,13 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
               out_scale = jnp.where(
                   absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
               )
-              # Quantize by exactly the stored (rounded) scale.
-              out_scale = out_scale.astype(out_scales_smem.dtype).astype(
-                  absmax.dtype
-              )
+              # Round the scale to its storage dtype ONCE; divide by exactly that
+              # rounded value (so q * stored_scale round-trips), store it as-is.
+              out_scale_q = out_scale.astype(out_scales_smem.dtype)
               inv = plgpu.layout_cast(
-                  lax.broadcast_in_dim(1.0 / out_scale, acc_carry.shape, [1]),
+                  lax.broadcast_in_dim(
+                      1.0 / out_scale_q.astype(absmax.dtype), acc_carry.shape, [1]
+                  ),
                   _TCGEN05_TRANSPOSED,
               )
               q = acc_t * inv
@@ -862,10 +863,35 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
               else:
                 q = jnp.clip(q, float(qinfo.min), float(qinfo.max))
               out_smem.T[...] = q.astype(epilogue_quant_dtype)
-              out_scales_smem[...] = out_scale.astype(out_scales_smem.dtype)
+              out_scales_smem[...] = out_scale_q
             plgpu.commit_smem()
 
           with jax.named_scope("SMEM -> GMEM"):
+            if epilogue_quant_enabled:
+              # Issue the per-row scale scatter FIRST, so its direct GMEM stores
+              # overlap the value-store TMA below instead of running serially
+              # after wait_smem_to_gmem (in the epilogue's no-drain window). The
+              # scatter is a raw memref store (not in the TMA commit group) and is
+              # flushed at kernel exit, so it needs no wait. It cannot go through
+              # copy_smem_to_gmem (a TMA needs the innermost copied dim >= 128
+              # bits, but a ragged group's m-window is an arbitrary number of bf16
+              # scales) and writes ONLY this group's valid rows [start_within_block,
+              # +actual_size) so a straddling tile never clobbers a neighbour's
+              # scale rows. The scale matrix is (n_sub, m); scale_col selects this
+              # CTA's N-subchannel and is transposed to (m, n_sub) on return.
+              scale_col = lax.div(
+                  tid_n * cluster_block_n + cluster_idx * block_n,
+                  epilogue_quant_subchannel_size,
+              )
+              write_scales_to_gmem(
+                  out_scales_gmem,
+                  out_scales_smem,
+                  actual_size,
+                  start_within_block,
+                  scale_col,
+                  block_start,
+                  cluster_block_m,
+              )
             # Write out the largest power of two rows first,
             # then the next largest, etc.
             # This allows us to coalesce writes as much as possible.
@@ -888,28 +914,6 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
               size //= 2
             plgpu.commit_smem_to_gmem_group()
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-            if epilogue_quant_enabled:
-              # The per-row fp8 scale cannot go through copy_smem_to_gmem: a TMA
-              # needs the innermost copied dim >= 128 bits, but a ragged group's
-              # m-window is an arbitrary number of bf16 scales. Scatter it per row
-              # with a thread predicate, writing ONLY this group's valid rows
-              # [start_within_block, +actual_size) so a tile straddling two groups
-              # never clobbers a neighbour's scale rows (the previous TODO/bug).
-              # The scale matrix is (n_sub, m); scale_col selects this CTA's
-              # N-subchannel and is transposed to (m, n_sub) on return.
-              scale_col = lax.div(
-                  tid_n * cluster_block_n + cluster_idx * block_n,
-                  epilogue_quant_subchannel_size,
-              )
-              write_scales_to_gmem(
-                  out_scales_gmem,
-                  out_scales_smem,
-                  actual_size,
-                  start_within_block,
-                  scale_col,
-                  block_start,
-                  cluster_block_m,
-              )
 
       return carry + (actual_size > 0)
 
@@ -1038,12 +1042,13 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
   num_sms = backend.get_default_device().core_count
   num_sms = num_sms // 2 if profile else num_sms
   if epilogue_quant_enabled:
-    # Scale written subchannel-major (n_subchannels, m) for TMA-contiguous
-    # stores; transposed back to (m, n_subchannels) on return.
+    # Scale written directly in (m, n_subchannels) order. The per-lane scatter is
+    # already uncoalesced, so m-major costs nothing at the store and avoids a
+    # transpose-on-return (one fewer XLA pass).
     out_shape = (
         jax.ShapeDtypeStruct((m, n), epilogue_quant_dtype),
         jax.ShapeDtypeStruct(
-            (n // epilogue_quant_subchannel_size, m),
+            (m, n // epilogue_quant_subchannel_size),
             epilogue_quant_input_dtype,
         ),
     )
@@ -1079,6 +1084,6 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
   )
   if epilogue_quant_enabled:
     qvalue, scales = out
-    # scales came out subchannel-major (n_subchannels, m); back to (m, n_sub).
-    return qwix.QArray(qvalue, scales.T, qtype=epilogue_quant_dtype)
+    # scales already written in (m, n_subchannels) order -- no transpose needed.
+    return qwix.QArray(qvalue, scales, qtype=epilogue_quant_dtype)
   return out
