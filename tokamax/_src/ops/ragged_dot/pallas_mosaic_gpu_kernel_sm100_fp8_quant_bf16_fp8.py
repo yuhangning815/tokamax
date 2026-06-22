@@ -168,7 +168,7 @@ def rescale_tcgen05_acc(running_acc, acc, row_scale, col_scale):
 
 
 def write_scales_to_gmem(
-    gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
+    gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m, cluster_block_m
 ):
   """Masked per-row SMEM->HBM store of this CTA's [cluster_block_m] fp8 scale.
 
@@ -182,6 +182,11 @@ def write_scales_to_gmem(
   Writes only rows [offset, offset+copy_size) of the tile:
   `out_scales[scale_col, block_start_m + row] = out_scales_smem[row]`. The scale
   GMEM is subchannel-major `(n_sub, m)`, so `m` is the last (index-1) dim.
+
+  `cluster_block_m` may exceed the 128 lanes, so each lane statically loops over
+  rows {lane, lane+128, ...}; the window predicate keeps every read/write in range
+  (the valid window is always within [0, cluster_block_m)). For <=128 it is a
+  single pass identical to before.
   """
 
   @plgpu.inline_mgpu(
@@ -201,23 +206,28 @@ def write_scales_to_gmem(
     # ~0.5us here -- the M-major epilogue made the barrier nearly free.)
     mgpu.utils.warpgroup_barrier()
     index = ir.IndexType.get()
-    tid = gpu.thread_id(gpu.Dimension.x)
-    row = arith.remui(tid, arith.constant(index, 128))
+    lane = arith.remui(gpu.thread_id(gpu.Dimension.x), arith.constant(index, 128))
     off_i = arith.index_cast(index, offset.registers.item())
     lim_i = arith.addi(
         off_i, arith.index_cast(index, copy_size.registers.item())
     )
-    cond = arith.andi(
-        arith.cmpi(arith.CmpIPredicate.sge, row, off_i),
-        arith.cmpi(arith.CmpIPredicate.slt, row, lim_i),
-    )
-    with mgpu.utils.when(cond):
-      col_i = arith.index_cast(index, scale_col.registers.item())
-      gmem_m = arith.addi(
-          arith.index_cast(index, block_start_m.registers.item()), row
+    col_i = arith.index_cast(index, scale_col.registers.item())
+    bs_i = arith.index_cast(index, block_start_m.registers.item())
+    # Each lane covers rows {lane, lane+128, ...}; static unroll (one pass <=128).
+    for base in range(0, cluster_block_m, 128):
+      row = (
+          lane
+          if base == 0
+          else arith.addi(arith.constant(index, base), lane)
       )
-      val = memref_dialect.load(smem_ref, [row])
-      memref_dialect.store(val, gmem_ref, [col_i, gmem_m])
+      cond = arith.andi(
+          arith.cmpi(arith.CmpIPredicate.sge, row, off_i),
+          arith.cmpi(arith.CmpIPredicate.slt, row, lim_i),
+      )
+      with mgpu.utils.when(cond):
+        gmem_m = arith.addi(bs_i, row)
+        val = memref_dialect.load(smem_ref, [row])
+        memref_dialect.store(val, gmem_ref, [col_i, gmem_m])
 
   return _store(
       gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
@@ -898,6 +908,7 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
                   start_within_block,
                   scale_col,
                   block_start,
+                  cluster_block_m,
               )
 
       return carry + (actual_size > 0)

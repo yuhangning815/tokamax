@@ -343,6 +343,41 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
 
+  @parameterized.product(block_m=(128, 256))
+  def test_epilogue_quant_ragged_large_block_m(self, block_m):
+    # cluster_block_m > 128 (256) -> more tokens than lanes, so the masked scale
+    # store must loop each lane over rows {lane, lane+128, ...}. 128 is the
+    # lane-count boundary. Ragged groups (size-1 + big) sum to m.
+    num_groups, m, k, n = 8, 1024, 256, 512
+    sub = 128
+    a, b, _ = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    group_sizes = jnp.array([130, 1, 200, 99, 150, 7, 250, 187], jnp.int32)
+    assert int(group_sizes.sum()) == m
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=block_m,
+        block_n=128,
+        block_k=128,
+        epilogue_quant_qtype=common.EpilogueQuantDType.FLOAT8_E4M3FN,
+        epilogue_quant_subchannel_size=sub,
+    )
+    out = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
+        a, b, group_sizes, jnp.bfloat16, config, None
+    )
+    actual = self._dequant(out, sub)
+    expected = test_base.ref(a, b, group_sizes, None)
+    count = int(group_sizes.sum())
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.06, rtol=0.1
+    )
+
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")
