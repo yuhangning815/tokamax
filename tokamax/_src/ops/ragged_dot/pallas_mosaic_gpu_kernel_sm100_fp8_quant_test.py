@@ -290,6 +290,45 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         out[:count], expected[:count], atol=0.01, rtol=0.005
     )
 
+  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
+  def test_epilogue_quant_ragged(self, block_k, activation):
+    # Ragged corner case: group starts (cumsum) 33,100,150,230,300,360,450 are
+    # NOT multiples of align_tile(8), so block_start is rounded DOWN and a tile
+    # straddles two groups (start_within_block != 0, actual_size < block_m). The
+    # fused scale store must write ONLY this group's valid rows; the old store
+    # wrote the whole aligned bucket and corrupted neighbours' scale rows. This
+    # also exercises the fp8 value store under a non-block-aligned block_start.
+    num_groups, m, k, n = 8, 512, 256, 512
+    sub = 128
+    a, b, _ = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    group_sizes = jnp.array([33, 67, 50, 80, 70, 60, 90, 62], jnp.int32)
+    assert int(group_sizes.sum()) == m
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=16,
+        block_n=128,
+        block_k=block_k,
+        epilogue_quant_qtype=common.EpilogueQuantDType.FLOAT8_E4M3FN,
+        epilogue_quant_subchannel_size=sub,
+    )
+    out = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
+        a, b, group_sizes, jnp.bfloat16, config, activation
+    )
+    self.assertIsInstance(out, qwix.QArray)
+    actual = self._dequant(out, sub)
+    expected = test_base.ref(a, b, group_sizes, activation)
+    count = int(group_sizes.sum())
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.06, rtol=0.1
+    )
+
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")

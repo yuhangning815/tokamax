@@ -38,7 +38,10 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import backend
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer  # pylint: disable=g-multiple-import,g-importing-member
+from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import arith
+from jaxlib.mlir.dialects import gpu
+from jaxlib.mlir.dialects import memref as memref_dialect
 import numpy as np
 import qwix
 from tokamax._src import jaxtyping
@@ -162,6 +165,62 @@ def rescale_tcgen05_acc(running_acc, acc, row_scale, col_scale):
     )
 
   return rescale(running_acc, acc, row_scale, col_scale)
+
+
+def write_scales_to_gmem(
+    gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
+):
+  """Masked per-row SMEM->HBM store of this CTA's [cluster_block_m] fp8 scale.
+
+  `copy_smem_to_gmem` cannot write a ragged group's scale window: a TMA needs the
+  innermost copied dim to be >= 128 bits, but a ragged m-window is an arbitrary
+  number of bf16 scales (e.g. 4 -> 64 bits, which fails to lower). So we scatter
+  per row with a thread predicate, mirroring block_scale's `write_scales_to_gmem`.
+  We read the value from SMEM by lane index (layout-agnostic) rather than from the
+  `_TCGEN05_COL` register fragment, which holds several m-rows per thread.
+
+  Writes only rows [offset, offset+copy_size) of the tile:
+  `out_scales[scale_col, block_start_m + row] = out_scales_smem[row]`. The scale
+  GMEM is subchannel-major `(n_sub, m)`, so `m` is the last (index-1) dim.
+  """
+
+  @plgpu.inline_mgpu(
+      arg_types=(
+          plgpu.RefType(),  # gmem_ref: out_scales (n_sub, m)
+          plgpu.RefType(),  # smem_ref: out_scales_smem [cluster_block_m]
+          plgpu.Layout.WG_SPLAT,  # copy_size = actual_size
+          plgpu.Layout.WG_SPLAT,  # offset = start_within_block
+          plgpu.Layout.WG_SPLAT,  # scale_col
+          plgpu.Layout.WG_SPLAT,  # block_start_m
+      ),
+  )
+  def _store(ctx, gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m):
+    del ctx
+    # out_scales_smem was written by this warpgroup in the epilogue; make those
+    # writes visible before any thread reads a (possibly other) lane's row.
+    mgpu.utils.warpgroup_barrier()
+    index = ir.IndexType.get()
+    tid = gpu.thread_id(gpu.Dimension.x)
+    row = arith.remui(tid, arith.constant(index, 128))
+    off_i = arith.index_cast(index, offset.registers.item())
+    lim_i = arith.addi(
+        off_i, arith.index_cast(index, copy_size.registers.item())
+    )
+    cond = arith.andi(
+        arith.cmpi(arith.CmpIPredicate.sge, row, off_i),
+        arith.cmpi(arith.CmpIPredicate.slt, row, lim_i),
+    )
+    with mgpu.utils.when(cond):
+      col_i = arith.index_cast(index, scale_col.registers.item())
+      gmem_m = arith.addi(
+          arith.index_cast(index, block_start_m.registers.item()), row
+      )
+      val = memref_dialect.load(smem_ref, [row])
+      memref_dialect.store(val, gmem_ref, [col_i, gmem_m])
+
+  return _store(
+      gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m
+  )
 
 
 def _compute_stages(
@@ -819,26 +878,29 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
 
               offset += actual_size & size
               size //= 2
-            if epilogue_quant_enabled:
-              # Scale: one [cluster_block_m] vector for this CTA's block_n
-              # N-columns, written subchannel-major (n_sub, m) so the m-slice is
-              # the contiguous last dim; transposed to (m, n_sub) on return.
-              # (Block-aligned groups assumed; ragged-group placement is a TODO.)
-              @pl.when(actual_size > 0)
-              def _():
-                scale_col = lax.div(
-                    tid_n * cluster_block_n + cluster_idx * block_n,
-                    epilogue_quant_subchannel_size,
-                )
-                plgpu.copy_smem_to_gmem(
-                    out_scales_smem.at[pl.ds(0, cluster_block_m)],
-                    out_scales_gmem.at[
-                        scale_col, pl.ds(block_start, cluster_block_m)
-                    ],
-                    commit_group=False,
-                )
             plgpu.commit_smem_to_gmem_group()
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            if epilogue_quant_enabled:
+              # The per-row fp8 scale cannot go through copy_smem_to_gmem: a TMA
+              # needs the innermost copied dim >= 128 bits, but a ragged group's
+              # m-window is an arbitrary number of bf16 scales. Scatter it per row
+              # with a thread predicate, writing ONLY this group's valid rows
+              # [start_within_block, +actual_size) so a tile straddling two groups
+              # never clobbers a neighbour's scale rows (the previous TODO/bug).
+              # The scale matrix is (n_sub, m); scale_col selects this CTA's
+              # N-subchannel and is transposed to (m, n_sub) on return.
+              scale_col = lax.div(
+                  tid_n * cluster_block_n + cluster_idx * block_n,
+                  epilogue_quant_subchannel_size,
+              )
+              write_scales_to_gmem(
+                  out_scales_gmem,
+                  out_scales_smem,
+                  actual_size,
+                  start_within_block,
+                  scale_col,
+                  block_start,
+              )
 
       return carry + (actual_size > 0)
 
