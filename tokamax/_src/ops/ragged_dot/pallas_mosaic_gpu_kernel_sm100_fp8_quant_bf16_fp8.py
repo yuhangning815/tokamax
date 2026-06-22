@@ -197,7 +197,8 @@ def write_scales_to_gmem(
   def _store(ctx, gmem_ref, smem_ref, copy_size, offset, scale_col, block_start_m):
     del ctx
     # out_scales_smem was written by this warpgroup in the epilogue; make those
-    # writes visible before any thread reads a (possibly other) lane's row.
+    # writes visible before any lane reads a (possibly other) lane's row. (Costs
+    # ~0.5us here -- the M-major epilogue made the barrier nearly free.)
     mgpu.utils.warpgroup_barrier()
     index = ir.IndexType.get()
     tid = gpu.thread_id(gpu.Dimension.x)
@@ -822,17 +823,18 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
                   plgpu.Layout.TCGEN05_TRANSPOSED,
               )
             else:
-              # Per-m-row absmax over block_n (axis 0) -> one scale per CTA's
-              # block_n N-columns (subchannel == block_n). Reduce axis 0 directly
-              # (auto cross-warp scratch); the [cluster_block_m] scale comes out
-              # in `_TCGEN05.reduce(0)`, broadcast back to `_TCGEN05` to match acc.
+              # Quantize in the TRANSPOSED (M-major) layout. acc is [block_n,
+              # cluster_block_m] in _TCGEN05; cast it to _TCGEN05_TRANSPOSED ONCE
+              # up front (the value store transposes anyway -- this just moves it
+              # earlier). Then the per-m-row absmax over block_n is reduce(0) of
+              # the TRANSPOSED layout = lane==m-row / 1 reg (like block_scale's
+              # reduce(1)), an in-register reduce, and the quantized value is
+              # already transposed so the SMEM store needs no second layout_cast.
               qinfo = jnp.finfo(epilogue_quant_dtype)
               is_int8 = epilogue_quant_dtype == jnp.int8
               qmax = 127.5 if is_int8 else float(qinfo.max)
-              # Quantize the f32 accumulator directly. The fused path never
-              # materializes bf16, so this is strictly more accurate than -- and
-              # skips the two casts of -- a standalone bf16 quantizer.
-              absmax = jnp.abs(acc_carry).max(axis=0)  # [cluster_block_m]
+              acc_t = plgpu.layout_cast(acc_carry, _TCGEN05_TRANSPOSED)
+              absmax = jnp.abs(acc_t).max(axis=0)  # [cluster_block_m]
               out_scale = jnp.where(
                   absmax == 0.0, jnp.array(1.0, absmax.dtype), absmax / qmax
               )
@@ -842,18 +844,14 @@ def ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
               )
               inv = plgpu.layout_cast(
                   lax.broadcast_in_dim(1.0 / out_scale, acc_carry.shape, [1]),
-                  _TCGEN05,
+                  _TCGEN05_TRANSPOSED,
               )
-              q = acc_carry * inv
+              q = acc_t * inv
               if is_int8:
                 q = jnp.round(jnp.clip(q, -127.5, 126.75))
               else:
                 q = jnp.clip(q, float(qinfo.min), float(qinfo.max))
-              # layout_cast in f32 (fp8/int8 _TCGEN05->TRANSPOSED is unsupported),
-              # then astype to the 1-byte output dtype.
-              out_smem.T[...] = plgpu.layout_cast(
-                  q, plgpu.Layout.TCGEN05_TRANSPOSED
-              ).astype(epilogue_quant_dtype)
+              out_smem.T[...] = q.astype(epilogue_quant_dtype)
               out_scales_smem[...] = out_scale.astype(out_scales_smem.dtype)
             plgpu.commit_smem()
 

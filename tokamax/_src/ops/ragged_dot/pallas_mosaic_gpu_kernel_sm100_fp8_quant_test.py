@@ -290,8 +290,10 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         out[:count], expected[:count], atol=0.01, rtol=0.005
     )
 
-  @parameterized.product(block_k=(128,), activation=(None, test_base.relu))
-  def test_epilogue_quant_ragged(self, block_k, activation):
+  @parameterized.product(
+      block_k=(128,), activation=(None, test_base.relu), block_m=(16, 64)
+  )
+  def test_epilogue_quant_ragged(self, block_k, activation, block_m):
     # Ragged corner case: group starts (cumsum) 33,100,150,230,300,360,450 are
     # NOT multiples of align_tile(8), so block_start is rounded DOWN and a tile
     # straddles two groups (start_within_block != 0, actual_size < block_m). The
@@ -312,7 +314,7 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
     assert int(group_sizes.sum()) == m
     config = dataclasses.replace(
         _CONFIG,
-        block_m=16,
+        block_m=block_m,
         block_n=128,
         block_k=block_k,
         epilogue_quant_qtype=common.EpilogueQuantDType.FLOAT8_E4M3FN,
