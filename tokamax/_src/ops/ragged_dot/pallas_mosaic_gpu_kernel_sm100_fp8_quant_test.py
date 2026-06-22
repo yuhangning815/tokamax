@@ -378,6 +378,41 @@ class PallasMosaicGpuKernelSm100FP8QuantTest(test_base.RaggedDotTestBase):
         actual[:count], expected[:count], atol=0.06, rtol=0.1
     )
 
+  @parameterized.product(activation=(None, test_base.relu))
+  def test_epilogue_quant_prod_config(self, activation):
+    # The production autotuned config for this fused kernel: block_m=32,
+    # block_k=256 (with weight subchannel 512, so block_k <= subchannel: 2
+    # block_k per subchannel, exercised by k=1024 -> 2 subchannels). Ragged.
+    num_groups, m, k, n = 8, 512, 1024, 512
+    sub = 512
+    a, b, _ = self._create_inputs(
+        num_groups, m, k, n, jnp.bfloat16,
+        use_as_qarray=False,
+        quant_a_dtype=jnp.float8_e4m3fn,
+        a_tile_shape=(1, sub),
+        quant_b_dtype=jnp.int4,
+        b_tile_shape=(1, sub, 1),
+    )
+    group_sizes = jnp.array([33, 67, 50, 80, 70, 60, 90, 62], jnp.int32)
+    assert int(group_sizes.sum()) == m
+    config = dataclasses.replace(
+        _CONFIG,
+        block_m=32,
+        block_n=128,
+        block_k=256,
+        epilogue_quant_qtype=common.EpilogueQuantDType.FLOAT8_E4M3FN,
+        epilogue_quant_subchannel_size=128,
+    )
+    out = sm100_fp8_quant_bf16_fp8.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(
+        a, b, group_sizes, jnp.bfloat16, config, activation
+    )
+    actual = self._dequant(out, 128)
+    expected = test_base.ref(a, b, group_sizes, activation)
+    count = int(group_sizes.sum())
+    chex.assert_trees_all_close(
+        actual[:count], expected[:count], atol=0.06, rtol=0.1
+    )
+
   def setUp(self):
     if jax.default_backend() == "tpu":
       self.skipTest("Not supported on TPUs.")

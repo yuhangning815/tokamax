@@ -47,7 +47,8 @@ def main():
       34, 33], jnp.int32)
 
   def cfg(epilogue):
-    c = common.Config(block_m=64, block_n=128, block_k=512, num_stages=2,
+    # Production autotuned config: block_m=32, block_k=256.
+    c = common.Config(block_m=32, block_n=128, block_k=256, num_stages=2,
                       split_k=1, split_m=1, persistent=True, post_scale=False,
                       collective=False, grid_minor_dim=common.MatmulDimension.M,
                       grid_tile_width=1)
@@ -61,7 +62,7 @@ def main():
   edot = jax.jit(lambda a, b, gs: epi.ragged_dot_gpu_fp8_quant_bf16_fp8_blackwell_kernel(a, b, gs, jnp.bfloat16, cfg(True), None))
   td = _bench(dot, a8, b, gs)
   te = _bench(edot, a8, b, gs)
-  print(f"block_k=512 block_m=64: dot {td*1e6:7.1f}us | epi-dot {te*1e6:7.1f}us | overhead {(te-td)*1e6:+6.1f}us")
+  print(f"block_k=256 block_m=32: dot {td*1e6:7.1f}us | epi-dot {te*1e6:7.1f}us | overhead {(te-td)*1e6:+6.1f}us")
 
 
 if __name__ == "__main__":
